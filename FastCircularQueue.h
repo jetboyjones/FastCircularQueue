@@ -1,12 +1,9 @@
 #ifndef _FAST_CIRCULAR_QUEUE_H
 #define _FAST_CIRCULAR_QUEUE_H
 
-#include <iostream>
+#include <functional>
+#include <atomic>
 #include <thread>
-#include <future>
-#include <vector>
-#include <queue>
-#include <list>
 
 namespace el {
     using namespace std;
@@ -15,29 +12,31 @@ namespace el {
      * Callback definition for dropped entry handling.
      */
     template<class T>
-    using DropCallback = std::function<void(T *)>;
+    using DropCallback = std::function<void(T&)>;
 
     /**
-     * A Proof of Concept Thread Safe queue class based on a circular buffer
-     * (backed by an array) and using atomic operation instead of a global mutex.
-     * Only a single thread can write but there can be multiple reader
-     * threads. It stores pointers to type T.
+     * A Proof of Concept Thread Safe queue class template based on a circular buffer
+     * (backed by an array) using atomic operation instead of a global mutex.
+     * In this implementation a single writer thread and multiple reader threads are supported.
+     * If the write index overruns the read index, packets from the front of the queue
+     * (the oldest) are purged to make room for new entries. The queue stores copies of T.
      *
-     * @tparam T
+     * See the formal spec (TLA+) for algorithm verification.
+     *
+     * @tparam T Type of object stored in the Queue - ideally use a smart pointer of some sort.
      */
     template<class T>
     class FastCircularQueue final {
-        using QueueElement = std::atomic<T *>;
 
     public:
         /**
          * One and only constructor for the PoC Queue.
          *
          * @param size - The size of the backing array for the queue
-         * @param purgeWindow - The number of items to purge if the writer overtakes the readers
+         * @param expireSize - The number of items to purge if the writer overtakes the readers
          * @param callback - Routine to call for purged items - ideally this should be quick.
          */
-        FastCircularQueue(size_t size, size_t purgeWindow, DropCallback<T> callback);
+        FastCircularQueue(size_t size, size_t expireSize, DropCallback<T> callback);
 
         /**
          * Note: This class is final so we don't need a vtable. If this class is changed to
@@ -49,9 +48,9 @@ namespace el {
          * Put an element onto the end of the queue - there can be only one thread doing
          * this.
          *
-         * @param element - A pointer to type T
+         * @param element - An object of type T
          */
-        void push(T *element);
+        void push(const T& element);
 
         /**
          * Pops and element off the front of the queue - this is thread-safe and there can
@@ -59,7 +58,7 @@ namespace el {
          *
          * @return An element of type T* from the from of the queue.
          */
-        T *pop();
+        T pop();
 
         /**
          * Reports if there are any elements currently in the queue - ephemeral if
@@ -88,15 +87,15 @@ namespace el {
         void expireOldEntries();
 
     private: //State
-        const size_t mReadIdxLock = -1;
+        const uint mReadIdxLock = -1;
 
-        int mBufferSize;
-        int mPurgeWindow;
-        int mWriteIdx;
-        std::atomic<int> mReadIdx;
-        std::atomic<int> mRWIndexOffset;
+        uint mBufferSize;
+        uint mExpireSize;
+        uint mWriteIdx;
+        std::atomic<uint> mReadIdx; //Used as read index and to lock reader critical section
+        std::atomic<uint> mRWIndexOffset; //Semaphore for read/write collision (also buffer count)
         DropCallback<T> mDropCallback;
-        QueueElement *mBuffer;
+        T* mBuffer;
 
     };
 
@@ -109,18 +108,13 @@ namespace el {
  */
     template<class T>
     FastCircularQueue<T>::FastCircularQueue(size_t size,
-                                            size_t purgeWindow,
+                                            size_t expireSize,
                                             DropCallback<T> dropCallback):
             mBufferSize(size),
-            mPurgeWindow(purgeWindow),
+            mExpireSize(expireSize),
             mWriteIdx(0), mReadIdx(0), mRWIndexOffset(0),
             mDropCallback(dropCallback),
-            mBuffer(new QueueElement[size]) {
-
-        for (int i = 0; i < size; ++i) {
-            mBuffer[i] = nullptr;
-        }
-
+            mBuffer(new T[size]) {
     }
 
 /*
@@ -135,36 +129,37 @@ namespace el {
  * Push an element onto the queue
  **/
     template<class T>
-    void FastCircularQueue<T>::push(T *element) {//Only one thread allowed
-        T *expected = nullptr;
-        //The only thing we need to check in the writer is that we're not going
-        //to overwrite the tail. A non-null entry means we've hit the tail. This
-        //should actually not happen as a buffer is maintained by purging the tail.
-        while (!mBuffer[mWriteIdx].compare_exchange_strong(expected, element)) {
-            //We've overrun the readers;
-            expected = nullptr;
-        }
-        //Increment the write index and wrap if necessary
-        mWriteIdx = (mWriteIdx + 1) % mBufferSize;
-        //Update the read index/write index offset
-        ++mRWIndexOffset;
-        //If we've caught up to the tail then start purging.
-        if (mRWIndexOffset > mBufferSize - 10) { //10 is an arbitrary padding
-            //Catching up to readers - Stop writing and purge the tail
+    void FastCircularQueue<T>::push(const T& element) {//Only one thread allowed
+
+        //Check the Read/Write semaphore
+        if (mRWIndexOffset >= mBufferSize) {
+            //We've overrun the end of the queue - drop oldest entries to make room;
             expireOldEntries();
         }
+
+        //Add the element;
+        mBuffer[mWriteIdx] = element;
+
+        //Increment the write index and wrap if necessary
+        mWriteIdx = (mWriteIdx + 1) % mBufferSize;
+
+        //Update the read index/write index offset - this needs to be atomic
+        ++mRWIndexOffset;
+
     }
 
 /*
 * Pop and element off the queue
 */
     template<class T>
-    T *el::FastCircularQueue<T>::pop() {
+    T el::FastCircularQueue<T>::pop() {
 
-        T *result = nullptr;
-        while (result == nullptr) {
+        T result;
+        bool done = false;
+        while (!done) {
             //Load the current read index
-            int currentReadIdx = mReadIdx.load();
+            uint currentReadIdx = mReadIdx;
+
             //If the current read index is not held by another thread - lock it.
             //This starts a critical section
             if ((currentReadIdx != mReadIdxLock) &&
@@ -172,7 +167,8 @@ namespace el {
                                                mReadIdxLock,
                                                memory_order_release,
                                                memory_order_relaxed)) {
-                //Only one thread should be here at any one time.
+                // CS: Start of Critical Section for readers
+                // Check Read/Write Semaphore
                 if (mRWIndexOffset < 1) {
                     //If we're here we've caught up to the front of the queue. Reset the read
                     //index and try again.
@@ -180,35 +176,18 @@ namespace el {
                     continue;
                 }
 
-                //Grab the value from the buffer and set it to null.
-                //If the writer thread is assured of not overwriting the tail
-                //(which I think it is) then this could probably be replaced with
-                // a non-atomic swap. This is mostly just a sanity check.
-                T *current = mBuffer[currentReadIdx].load();
-                if ((current != nullptr) &&
-                    !mBuffer[currentReadIdx].compare_exchange_strong(current,
-                                                                     nullptr,
-                                                                     memory_order_release,
-                                                                     memory_order_relaxed)) {
-                    cout << "This should never fail!" << endl;
-                }
-                //Calculate a new read index
-                int nextIdx = (currentReadIdx + 1) % mBufferSize;
-                //Decrement the read/write index offset
+                //Fetch the value from the buffer
+                result = mBuffer[currentReadIdx];
+
+                //Decrement the read/write index offset - this must be atomic and come before
+                //update to mReadIdx
                 --mRWIndexOffset;
-                //Just a sanity check
-                if (mRWIndexOffset < 0) {
-                    cout << "Ooops" << endl;
-                }
-                result = current;
-                int test = mReadIdxLock;
-                //Set the new read index.
-                //This unlocks the the critical section. It should never fail so
-                //the test is a sanity check and we could probably replace the atomic
-                //swap it with an assignment.
-                if (!mReadIdx.compare_exchange_strong(test, nextIdx)) {
-                    std::cout << "This should never fail!" << std::endl;
-                }
+
+                //Calculate a new read index - does not have to be atomic
+                mReadIdx = (currentReadIdx + 1) % mBufferSize;
+
+                done = true;
+                // CS: End of Critical Section
             } else {
                 std::this_thread::yield(); //Yield to the next thread
                 if (isEmpty()) break; //If the queue is empty, break out.
@@ -222,8 +201,8 @@ namespace el {
 //be called from the the writer thread.
     template<class T>
     inline void FastCircularQueue<T>::expireOldEntries() {
-        while (mRWIndexOffset > mBufferSize - mPurgeWindow) {
-            T *dropMe = pop();
+        while (mRWIndexOffset > mBufferSize - mExpireSize) {
+            T dropMe = pop();
             if (mDropCallback != nullptr) {
                 mDropCallback(dropMe);
             }
@@ -244,11 +223,7 @@ namespace el {
  */
     template<class T>
     size_t FastCircularQueue<T>::countElements() {
-        size_t result = 0;
-        for (int i = 0; i < mBufferSize; ++i) {
-            if (mBuffer[i] != nullptr) ++result;
-        }
-        return result;
+        return mRWIndexOffset;
     }
 }
 

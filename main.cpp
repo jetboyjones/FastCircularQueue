@@ -1,11 +1,12 @@
+#include "FastCircularQueue.h"
+
 #include <iostream>
-#include <thread>
 #include <future>
 #include <vector>
 #include <queue>
-#include <list>
 
-#include "FastCircularQueue.h"
+
+using std::shared_ptr;
 
 /*************************************
  * A test item to enqueue and deque
@@ -18,9 +19,11 @@ struct TestObject {
         None, Add, Rem, Purg
     } lastOp;
 
+    TestObject() : refcount(0), id(-1), lastOp(None) {};
     TestObject(int recId) : refcount(0), id(recId), lastOp(None) {};
 };
 
+using TObj = shared_ptr<TestObject>;
 
 /**************************************
  * Helper functions for testing
@@ -37,7 +40,7 @@ struct LastOp {
 using History = std::deque<LastOp *>;
 
 //Add an Item to a history queue - history is constant size
-void updateHistory(const TestObject* rec, History& history) {
+void updateHistory(const TObj& rec, History& history) {
     //Remove record from front - alter it - put it on the back
     LastOp *op = history.front();
     history.pop_front();
@@ -77,15 +80,14 @@ thread_local History writeHistory;
 bool done = false;
 
 //Writer Thread Loop
-template<class T>
-void writerTask(el::FastCircularQueue<T> &queue, std::vector<T *> &values, int reps) {
+void writerTask(el::FastCircularQueue<TObj> &queue, std::vector<TObj> &values, int reps) {
 
     initHistory(writeHistory, 15);
     size_t idx = 0;
     int iterations = 0;
 
     while (!done) {
-        T *rec = values.data()[idx];
+        auto rec = values.data()[idx];
         queue.push(rec);
 
         {
@@ -114,12 +116,7 @@ void writerTask(el::FastCircularQueue<T> &queue, std::vector<T *> &values, int r
 static int gPurgeCount = 0;
 
 //Callback for handling items removed via purge
-template<class T>
-void dropHandler(T *rec) {
-
-    if (rec == nullptr) {
-        return;
-    }
+void dropHandler(TObj& rec) {
 
     {
         //This critical section maintains the integrity of the record
@@ -139,28 +136,24 @@ void dropHandler(T *rec) {
 }
 
 //Reader Thread Loop
-template<class T>
-void readerTask(el::FastCircularQueue<T> &queue) {
+void readerTask(el::FastCircularQueue<TObj> &queue) {
     History history;
     initHistory(history, 15);
 
     while (!done || !queue.isEmpty()) {
-        T *rec = queue.pop();
-        if (rec != nullptr) {
-            {
-                //This critical section maintains the integrity of the record
-                //but could result in a refcount < 0 because the write thread may
-                //have yielded before it updated the refcount
-                std::lock_guard<std::mutex> lock(rec->mutex);
-                rec->lastOp = rec->Rem;
-                --rec->refcount;
-                if (rec->refcount < 0) {
-                    std::cout << "Refcount < 0 = " << rec->refcount;
-                    std::cout << " (" << rec->id << ")" << std::endl;
-                }
-            }
-            updateHistory(rec, history);
+        auto rec = queue.pop();
+        //This critical section maintains the integrity of the record
+        //but could result in a refcount < 0 because the write thread may
+        //have yielded before it updated the refcount
+        std::lock_guard<std::mutex> lock(rec->mutex);
+        rec->lastOp = rec->Rem;
+        --rec->refcount;
+        if (rec->refcount < 0) {
+            std::cout << "Refcount < 0 = " << rec->refcount;
+            std::cout << " (" << rec->id << ")" << std::endl;
         }
+
+        updateHistory(rec, history);
     }
 
     dumpHistory(history);
@@ -172,16 +165,16 @@ int main() {
     //Set up the queue
     int queueSize = 10000;
     int purgeWindow = 100;
-    el::FastCircularQueue<TestObject> fastQueue(
+    el::FastCircularQueue<TObj> fastQueue(
             queueSize,
             purgeWindow,
-            dropHandler<TestObject>);
+            dropHandler);
 
     //Allocate some test objects
-    std::vector<TestObject *> testObjectVec;
+    std::vector<TObj> testObjectVec;
     testObjectVec.reserve(queueSize * 2); //Double the queue size
     for (int i = 0; i < queueSize * 2; ++i) {
-        testObjectVec.push_back(new TestObject(i));
+        testObjectVec.emplace_back(new TestObject(i));
     }
 
     //Start up the writer thread
@@ -189,7 +182,7 @@ int main() {
     //repitions * testObjectVec.size() needs to fit into an int
     const int repitions = 1000;
     auto writer = std::async(std::launch::async,
-                             writerTask<TestObject>,
+                             writerTask,
                              std::ref(fastQueue),
                              std::ref(testObjectVec),
                              repitions);
@@ -198,7 +191,7 @@ int main() {
     const int nWorkers = 6; //Number of worker threads
     std::vector<std::future<void>> wrkrs;
     for (int i = 0; i < nWorkers; ++i) {
-        auto wrkr = std::async(std::launch::async, readerTask<TestObject>, std::ref(fastQueue));
+        auto wrkr = std::async(std::launch::async, readerTask, std::ref(fastQueue));
         wrkrs.push_back(move(wrkr));
     }
 
@@ -216,7 +209,7 @@ int main() {
     //Print out run metrics
     int maxRef = 0;
     int minRef = 0;
-    for (TestObject *rec: testObjectVec) {
+    for (TObj& rec: testObjectVec) {
         if (rec->refcount > maxRef) maxRef = rec->refcount;
         if (rec->refcount < minRef) minRef = rec->refcount;
     }
