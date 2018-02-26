@@ -1,2 +1,5 @@
 *toolbox/*SnapShot_*
 .idea/
+*build/
+*#*
+FCQ.toolbox/

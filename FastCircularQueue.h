@@ -1,3 +1,19 @@
+/*
+FastCircularQueue
+Copyright (C)  2017  Earthlight Research, Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details
+(see <http://www.gnu.org/licenses/>).
+*/
+
 #ifndef _FAST_CIRCULAR_QUEUE_H
 #define _FAST_CIRCULAR_QUEUE_H
 
@@ -15,7 +31,7 @@ namespace el {
     using DropCallback = std::function<void(T&)>;
 
     /**
-     * A Proof of Concept Thread Safe queue class template based on a circular buffer
+     * A Proof of Concept Thread Safe queue template class template based on a circular buffer
      * (backed by an array) using atomic operation instead of a global mutex.
      * In this implementation a single writer thread and multiple reader threads are supported.
      * If the write index overruns the read index, packets from the front of the queue
@@ -34,9 +50,9 @@ namespace el {
          *
          * @param size - The size of the backing array for the queue
          * @param expireSize - The number of items to purge if the writer overtakes the readers
-         * @param callback - Routine to call for purged items - ideally this should be quick.
+         * @param dropCallback - Routine to call for purged items - ideally this should be quick.
          */
-        FastCircularQueue(size_t size, size_t expireSize, DropCallback<T> callback);
+        FastCircularQueue(size_t size, size_t expireSize, DropCallback<T> dropCallback);
 
         /**
          * Note: This class is final so we don't need a vtable. If this class is changed to
@@ -197,7 +213,7 @@ namespace el {
         return result;
     }
 
-//Helper function to drop packets from the tail fo the queue. It's intended to
+//Helper function to drop packets from the tail of the queue. It's intended to
 //be called from the the writer thread.
     template<class T>
     inline void FastCircularQueue<T>::expireOldEntries() {

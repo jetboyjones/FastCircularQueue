@@ -3,6 +3,26 @@ project(FastCircularQueue)
 
 set(CMAKE_CXX_STANDARD 11)
 
-set(SOURCE_FILES FastCircularQueue.h main.cpp)
+# Download and unpack googletest at configure time
+configure_file(CMakeLists_in.txt
+        googletest-download/CMakeLists.txt)
+execute_process(COMMAND ${CMAKE_COMMAND} -G "${CMAKE_GENERATOR}" .
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/googletest-download )
+execute_process(COMMAND ${CMAKE_COMMAND} --build .
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/googletest-download )
 
-add_executable(FastCircularQueue ${SOURCE_FILES})
+# Add googletest directly to our build. This adds
+# the following targets: gtest, gtest_main, gmock
+# and gmock_main
+add_subdirectory(${CMAKE_BINARY_DIR}/googletest-src
+        ${CMAKE_BINARY_DIR}/googletest-build)
+
+enable_testing()
+
+add_subdirectory(test)
+
+set(SOURCE_FILES FastCircularQueue.h)
+
+# add_executable(FastCircularQueue ${SOURCE_FILES})
+
+# add_library(FastCircularQueue, ${SOURCE_FILES})
